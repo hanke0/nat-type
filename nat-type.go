@@ -46,8 +46,9 @@ const (
 	OtherAddress      = 0x802c
 )
 
+const MagicCookie = 0x2112A442
+
 var (
-	MagicCookie         = [4]byte{0x21, 0x12, 0xA4, 0x42}
 	ChangeIPAttr        = [4]byte{0, 0, 0, 0x4}
 	ChangePortAttr      = [4]byte{0, 0, 0, 0x2}
 	ChangeIPAndPortAttr = [4]byte{0, 0, 0, 0x6}
@@ -94,7 +95,7 @@ func (h *Header) SetType(typ uint16) {
 // NewHeader creates a new Header with transaction setting proper.
 func NewHeader() Header {
 	var h Header
-	copy(h[4:8], MagicCookie[:])
+	binary.BigEndian.PutUint32(h[4:8], MagicCookie)
 	rand.Read(h[8:20])
 	return h
 }
@@ -105,15 +106,29 @@ func GetHeader() Header {
 	return defaultHeader
 }
 
+// Attribute of message
+//
+// 0                   1                   2                   3
+// 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |         Type                  |            Length             |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                         Value (variable)                ....
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type Attribute struct {
 	Type  int
 	Value []byte
 }
 
+func align4(n int) int {
+	return (n + 3) & 0xfffc
+}
+
 func (a Attribute) Bytes() []byte {
-	data := make([]byte, len(a.Value)+4)
+	n := align4(len(a.Value))
+	data := make([]byte, n+4)
 	binary.BigEndian.PutUint16(data[:2], uint16(a.Type))
-	binary.BigEndian.PutUint16(data[2:4], uint16(len(a.Value)))
+	binary.BigEndian.PutUint16(data[2:4], uint16(n))
 	copy(data[4:], a.Value)
 	return data
 }
@@ -130,13 +145,14 @@ func parseAttribute(data []byte) (int, Attribute) {
 	}
 	typ := binary.BigEndian.Uint16(data[:2])
 	length := binary.BigEndian.Uint16(data[2:4])
-	n := int(length) + 4
+	alignlen := align4(int(length))
+	n := alignlen + 4
 	if len(data) < n {
 		return 0, Attribute{}
 	}
 	return n, Attribute{
 		Type:  int(typ),
-		Value: copybytes(data[4:n]),
+		Value: copybytes(data[4:length]),
 	}
 }
 
@@ -219,6 +235,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, fmt.Errorf("set sendto timeout: %w", err)
 	}
+	fmt.Println(raw)
 	n, err := conn.WriteToUDP(raw, stun)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sendto: %w", err)
@@ -227,7 +244,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 		return nil, nil, fmt.Errorf("sendto incomplete: %d != %d", n, len(raw))
 	}
 
-	buf := make([]byte, 512) // it an safe udp package size, and usually contains full message.
+	buf := make([]byte, 2048) // it an safe udp package size, and usually contains full message.
 	transaction := head.Transaction()
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
