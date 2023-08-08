@@ -29,8 +29,8 @@ func init() {
 // Message Types
 // describe in
 //
-//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.1
-//	https://www.rfc-editor.org/rfc/rfc5389.html#section-6
+//    https://www.rfc-editor.org/rfc/rfc3489.html#section-11.1
+//    https://www.rfc-editor.org/rfc/rfc5389.html#section-6
 const (
 	BindingRequest            = 0x0001
 	BindingResponse           = 0x0101
@@ -43,9 +43,9 @@ const (
 // Attributes Types
 // describe in
 //
-//	https://www.rfc-editor.org/rfc/rfc5389.html#section-18.2
-//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.2
-//	https://www.rfc-editor.org/rfc/rfc5780.html#section-7
+//    https://www.rfc-editor.org/rfc/rfc5389.html#section-18.2
+//    https://www.rfc-editor.org/rfc/rfc3489.html#section-11.2
+//    https://www.rfc-editor.org/rfc/rfc5780.html#section-7
 const (
 	MappedAddress     = 0x0001
 	ResponseAddress   = 0x0002
@@ -167,7 +167,7 @@ func parseAttribute(data []byte) (int, Attribute) {
 
 func parseAttributes(data []byte) []Attribute {
 	var r = make([]Attribute, 0)
-	verbose1.Printf("attribute length %d", len(data))
+	verbose2.Printf("attribute length %d", len(data))
 	for len(data) > 0 {
 		n, attr := parseAttribute(data)
 		verbose2.Printf("parse 1 attribute: consume=%d, total=%d", n, len(data))
@@ -287,7 +287,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 		if !bytes.Equal(h.Transaction(), transaction) {
 			continue
 		}
-		verbose1.Printf("recvfrom message type 0x%x", h.Type())
+		verbose2.Printf("message type 0x%x", h.Type())
 		data = data[len(h):]
 		length := h.Length()
 		if len(data) < length {
@@ -301,39 +301,91 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 	}
 }
 
+type Addr struct {
+	*net.UDPAddr
+}
+
+func (i Addr) String() string {
+	if i.UDPAddr == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%s:%d", i.IP, i.Port)
+}
+
+func (i Addr) MarshalText() ([]byte, error) {
+	return []byte(i.String()), nil
+}
+
+func (i Addr) UnmarshalText(text []byte) error {
+	addr, err := net.ResolveUDPAddr("udp", string(text))
+	if err != nil {
+		return err
+	}
+	i.UDPAddr = addr
+	return nil
+}
+
 type Addresses struct {
-	RemoteAddr       *net.UDPAddr
-	MappedAddress    *net.UDPAddr
-	SourceAddress    *net.UDPAddr
-	ChangedAddress   *net.UDPAddr
-	XORMappedAddress *net.UDPAddr
+	MappedAddress    Addr
+	SourceAddress    Addr
+	ChangedAddress   Addr
+	XORMappedAddress Addr
 	ErrorCode        int
 	ErrorMessage     string
-	Sofeware         string
+	Software         string
 	UnknownAttrs     []Attribute
 }
 
-func (a *Addresses) GetMappedAddress() *net.UDPAddr {
-	if a.XORMappedAddress != nil {
-		return a.XORMappedAddress
-	}
-	return a.MappedAddress
+func (a *Addresses) String() string {
+	return stringify(a)
 }
 
-func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute) (*Addresses, error) {
+func (a *Addresses) GetMappedAddress() *net.UDPAddr {
+	if a.XORMappedAddress.UDPAddr != nil {
+		return a.XORMappedAddress.UDPAddr
+	}
+	return a.MappedAddress.UDPAddr
+}
+
+func (a *Addresses) GetSourceAddress() *net.UDPAddr {
+	return a.SourceAddress.UDPAddr
+}
+
+func (a *Addresses) GetError() error {
+	if a.ErrorCode != 0 {
+		return fmt.Errorf("%d %s", a.ErrorCode, a.ErrorMessage)
+	}
+	return nil
+}
+
+func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, changeIP, changePort bool) (*Addresses, error) {
 	head := GetHeader()
 	head.SetType(BindingRequest)
 	var data []byte
-	sendattrs = append(sendattrs, Attribute{
-		Type:  Software,
-		Value: []byte(`Nat-Type`),
-	})
+	sendattrs := []Attribute{
+		{Type: Software, Value: []byte(`stun`)},
+	}
+	if changeIP && changePort {
+		sendattrs = append(sendattrs, Attribute{
+			Type:  ChangeRequest,
+			Value: ChangeIPAndPortAttr[:],
+		})
+	} else if changeIP {
+		sendattrs = append(sendattrs, Attribute{
+			Type:  ChangeRequest,
+			Value: ChangeIPAttr[:],
+		})
+	} else if changePort {
+		sendattrs = append(sendattrs, Attribute{
+			Type:  ChangedAddress,
+			Value: ChangePortAttr[:],
+		})
+	}
 	for _, a := range sendattrs {
 		data = append(data, a.Bytes()...)
 	}
 	var (
 		attrs []Attribute
-		addr  *net.UDPAddr
 		err   error
 	)
 	// RFC 3489: Clients SHOULD retransmit the request starting with an interval
@@ -343,7 +395,7 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute
 	var timeout = time.Millisecond * 100
 	const maxTimeout = time.Second + time.Millisecond*600 // 1.6s
 	for i := 0; i < 9; i++ {
-		attrs, addr, err = sendAndRecv(conn, stun, head, data, timeout)
+		attrs, _, err = sendAndRecv(conn, stun, head, data, timeout)
 		if err != nil {
 			timeout *= 2
 			if timeout > maxTimeout {
@@ -358,23 +410,23 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute
 	}
 
 	var addrs Addresses
-	addrs.RemoteAddr = addr
 	for _, a := range attrs {
 		switch a.Type {
 		case MappedAddress:
-			addrs.MappedAddress = a.GetAddress(nil)
+			addrs.MappedAddress = Addr{a.GetAddress(nil)}
 		case SourceAddress:
-			addrs.SourceAddress = a.GetAddress(nil)
-		case ChangedAddress:
-			addrs.ChangedAddress = a.GetAddress(nil)
+			addrs.SourceAddress = Addr{a.GetAddress(nil)}
+		case ChangedAddress, OtherAddress:
+			// describe rfc5780, other address is a rename of changed address
+			addrs.ChangedAddress = Addr{a.GetAddress(nil)}
 		case XORMappedAddress, XORMappedAddressNonStd:
-			addrs.XORMappedAddress = a.GetAddress(head.Transaction())
+			addrs.XORMappedAddress = Addr{a.GetAddress(head.Transaction())}
 		case ErrorCode:
 			code, msg := a.GetErrorCode()
 			addrs.ErrorCode = code
 			addrs.ErrorMessage = msg
 		case Software:
-			addrs.Sofeware = a.GetString()
+			addrs.Software = a.GetString()
 		default:
 			addrs.UnknownAttrs = append(addrs.UnknownAttrs, a)
 		}
@@ -382,45 +434,131 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute
 	return &addrs, nil
 }
 
+const (
+	OpenInternet          = "On the open Internet"
+	FirewallBlockUDP      = "Firewall that blocks UDP"
+	SymmetricUDPFirewall  = "symmetric UDP Firewall"
+	FullConeNAT           = "Full-cone NAT"
+	SymmetricNAT          = "Symmetric NAT"
+	RestrictedConeNAT     = "Restricted cone NAT"
+	RestrictedPortConeNAT = "Restricted port cone NAT"
+)
+
 type NatType struct {
-	Addrs    *Addresses
-	Internal net.IP
+	Mapped   Addr
+	Internal Addr
+	Topology string
 }
 
 func (nt *NatType) String() string {
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	enc.Encode(nt)
-	return buf.String()
+	return stringify(nt)
 }
 
+// getNATTypeByRFC3489 gets NAT type as describe in rfc3489
+//
+//
+//                         +--------+
+//                         |  Test  |
+//                         |   I    |
+//                         +--------+
+//                              |
+//                              |
+//                              V
+//                             /\              /\
+//                          N /  \ Y          /  \ Y             +--------+
+//           UDP     <-------/Resp\--------->/ IP \------------->|  Test  |
+//           Blocked         \ ?  /          \Same/              |   II   |
+//                            \  /            \? /               +--------+
+//                             \/              \/                    |
+//                                              | N                  |
+//                                              |                    V
+//                                              V                    /\
+//                                          +--------+  Sym.      N /  \
+//                                          |  Test  |  UDP    <---/Resp\
+//                                          |   II   |  Firewall   \ ?  /
+//                                          +--------+              \  /
+//                                              |                    \/
+//                                              V                     |Y
+//                   /\                         /\                    |
+//    Symmetric  N  /  \       +--------+   N  /  \                   V
+//       NAT  <--- / IP \<-----|  Test  |<--- /Resp\               Open
+//                 \Same/      |   I    |     \ ?  /               Internet
+//                  \? /       +--------+      \  /
+//                   \/                         \/
+//                   |                           |Y
+//                   |                           |
+//                   |                           V
+//                   |                           Full
+//                   |                           Cone
+//                   V              /\
+//               +--------+        /  \ Y
+//               |  Test  |------>/Resp\---->Restricted
+//               |   III  |       \ ?  /
+//               +--------+        \  /
+//                                  \/
+//                                   |N
+//                                   |       Port
+//                                   +------>Restricted
+//
+// In test I, the client sends a
+// STUN Binding Request to a server, without any flags set in the
+// CHANGE-REQUEST attribute, and without the RESPONSE-ADDRESS attribute.
+// This causes the server to send the response back to the address and
+// port that the request came from.
+// In test II, the client sends a
+// Binding Request with both the "change IP" and "change port" flags
+// from the CHANGE-REQUEST attribute set.
+// In test III, the client sends
+// a Binding Request with only the "change port" flag set.
 func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
-	var (
-		nt  NatType
-		err error
-	)
-	if stun.IP.To4() == nil {
-		nt.Internal, err = getInternalIPv6()
-	} else {
-		nt.Internal, err = getInternalIPv4()
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	sock, err := listen()
+	sock, err := net.DialUDP("udp", nil, stun)
 	if err != nil {
 		return nil, err
 	}
 	defer sock.Close()
-	addrs, err := sendBindRequest(sock, stun, nil)
+	var nt NatType
+	nt.Internal = Addr{sock.LocalAddr().(*net.UDPAddr)}
+
+	addrs1, err := sendBindRequest(sock, stun, false, false)
+	verbose1.Printf("test1: %v, %s", err, addrs1)
 	if err != nil {
 		return nil, err
 	}
-	nt.Addrs = addrs
+	if err := addrs1.GetError(); err != nil {
+		return nil, err
+	}
+	mapped := addrs1.GetMappedAddress()
+	if mapped == nil {
+		return &nt, nil
+	}
+	if err := checkSourceAddress(addrs1, stun); err != nil {
+		return nil, err
+	}
+	test1same := addrEqual(addrs1.GetMappedAddress(), nt.Internal.UDPAddr)
+	addrs2, err := sendBindRequest(sock, stun, true, true)
+	verbose1.Printf("test2: %v, %s", err, addrs2)
+
+	if test1same {
+		if err != nil || addrs2.GetError() != nil {
+			nt.Mapped = Addr{mapped}
+			nt.Topology = SymmetricUDPFirewall
+			return &nt, nil
+		}
+		nt.Mapped = Addr{mapped}
+		nt.Topology = OpenInternet
+		return &nt, nil
+	}
+
 	return &nt, nil
+}
+
+func checkSourceAddress(addrs *Addresses, stun *net.UDPAddr) error {
+	if source := addrs.GetSourceAddress(); source != nil {
+		if addrEqual(source, stun) {
+			return errors.New("server error: bad response IP/port")
+		}
+	}
+	return nil
 }
 
 func getInternalIPv4() (net.IP, error) {
@@ -443,10 +581,6 @@ func getInternalIPv6() (net.IP, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }
 
-func listen() (*net.UDPConn, error) {
-	return net.ListenUDP("udp", nil)
-}
-
 func align4(n int) int {
 	return (n + 3) & 0xfffc
 }
@@ -465,8 +599,23 @@ func copybytes(d []byte) []byte {
 	return a
 }
 
+func stringify(a interface{}) string {
+	if a == nil {
+		return "null"
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.Encode(a)
+	return buf.String()
+}
+
+func addrEqual(a, b *net.UDPAddr) bool {
+	return bytes.Equal(a.IP, b.IP) && a.Port == b.Port
+}
+
 func main() {
-	stun, err := net.ResolveUDPAddr("udp4", "stun.ekiga.net:3478")
+	stun, err := net.ResolveUDPAddr("udp4", "stun.qq.com:3478")
 	if err != nil {
 		panic(err)
 	}
