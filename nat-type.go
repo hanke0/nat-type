@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -38,6 +41,7 @@ const (
 	UnknownAttributes = 0x000a
 	ReflectedFrom     = 0x000b
 	XORMappedAddress  = 0x0020
+	Software          = 0x8022
 	ResponseOrigin    = 0x802b
 	OtherAddress      = 0x802c
 )
@@ -95,16 +99,10 @@ func NewHeader() Header {
 	return h
 }
 
-type AttrHeader [4]byte
+var defaultHeader = NewHeader()
 
-func (ah AttrHeader) Type() int {
-	i := binary.BigEndian.Uint16(ah[:2])
-	return int(i)
-}
-
-func (ah AttrHeader) Length() int {
-	i := binary.BigEndian.Uint16(ah[2:4])
-	return int(i)
+func GetHeader() Header {
+	return defaultHeader
 }
 
 type Attribute struct {
@@ -205,15 +203,12 @@ func parseAttributes(data []byte) []Attribute {
 	return r
 }
 
-func listen(ip net.IP, port uint16) (*net.UDPConn, error) {
-	return net.ListenUDP("udp", &net.UDPAddr{IP: ip, Port: int(port)})
+func listen() (*net.UDPConn, error) {
+	return net.ListenUDP("udp", nil)
 }
 
-const readTimeout = time.Second * 3
-const writeTimeout = time.Second * 3
-
-func sendAndRecv(conn *net.UDPConn, ip net.IP, port uint16,
-	head Header, body []byte) ([]Attribute, *net.UDPAddr, error) {
+func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
+	head Header, body []byte, timeout time.Duration) ([]Attribute, *net.UDPAddr, error) {
 	if len(body) > math.MaxUint16 {
 		return nil, nil, errors.New("too big data body")
 	}
@@ -221,23 +216,26 @@ func sendAndRecv(conn *net.UDPConn, ip net.IP, port uint16,
 	raw := make([]byte, len(head)+len(body))
 	copy(raw, head[:])
 	copy(raw[len(head):], body)
-	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-		return nil, nil, err
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, fmt.Errorf("set sendto timeout: %w", err)
 	}
-	_, err := conn.WriteToUDP(body, &net.UDPAddr{IP: ip, Port: int(port)})
+	n, err := conn.WriteToUDP(raw, stun)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("sendto: %w", err)
+	}
+	if n != len(raw) {
+		return nil, nil, fmt.Errorf("sendto incomplete: %d != %d", n, len(raw))
 	}
 
 	buf := make([]byte, 512) // it an safe udp package size, and usually contains full message.
 	transaction := head.Transaction()
 	for {
-		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-			return nil, nil, err
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return nil, nil, fmt.Errorf("set recvfrom timeout: %w", err)
 		}
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("recvfrom: %w", err)
 		}
 		data := buf[:n]
 		var h Header
@@ -273,17 +271,43 @@ type Addresses struct {
 	UnknownAttrs     []Attribute
 }
 
-func sendBindRequest(conn *net.UDPConn, ip net.IP, port uint16, sendattrs []Attribute) (*Addresses, error) {
-	var head Header
+func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute) (*Addresses, error) {
+	head := GetHeader()
 	head.SetType(BindingRequest)
 	var data []byte
+	sendattrs = append(sendattrs, Attribute{
+		Type:  Software,
+		Value: []byte(`Nat-Type`),
+	})
 	for _, a := range sendattrs {
 		data = append(data, a.Bytes()...)
 	}
-	attrs, addr, err := sendAndRecv(conn, ip, port, head, data)
+	var (
+		attrs []Attribute
+		addr  *net.UDPAddr
+		err   error
+	)
+	// RFC 3489: Clients SHOULD retransmit the request starting with an interval
+	// of 100ms, doubling every retransmit until the interval reaches 1.6s.
+	// Retransmissions continue with intervals of 1.6s until a response is
+	// received, or a total of 9 requests have been sent.
+	var timeout = time.Millisecond * 100
+	const maxTimeout = time.Second + time.Millisecond*600 // 1.6s
+	for i := 0; i < 9; i++ {
+		attrs, addr, err = sendAndRecv(conn, stun, head, data, timeout)
+		if err != nil {
+			timeout *= 2
+			if timeout > maxTimeout {
+				timeout = maxTimeout
+			}
+			continue
+		}
+		break
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	var addrs Addresses
 	addrs.RecvAddr = addr
 	for _, a := range attrs {
@@ -305,6 +329,59 @@ func sendBindRequest(conn *net.UDPConn, ip net.IP, port uint16, sendattrs []Attr
 	return &addrs, nil
 }
 
-func natTypeByRFC3489(localhost net.IP, localport uint16, stunhost net.IP, stunport uint16) {
+type NatType struct {
+	Addrs *Addresses
+}
 
+func (nt *NatType) String() string {
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.Encode(nt)
+	return buf.String()
+}
+
+func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
+	sock, err := listen()
+	if err != nil {
+		return nil, err
+	}
+	defer sock.Close()
+	addrs, err := sendBindRequest(sock, stun, nil)
+	if err != nil {
+		return nil, err
+	}
+	var nt NatType
+	nt.Addrs = addrs
+	return &nt, nil
+}
+
+func getInternalIPv4() net.IP {
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 1})
+	if err != nil {
+		return nil
+	}
+	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+var googleIPv6 = net.ParseIP("2001:4860:4860::8888")
+
+func getInternalIPv6() net.IP {
+	conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: googleIPv6, Port: 1})
+	if err != nil {
+		return nil
+	}
+	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+func main() {
+	stun, err := net.ResolveUDPAddr("udp4", "stun.ekiga.net:3478")
+	if err != nil {
+		panic(err)
+	}
+	nt, err := getNATTypeByRFC3489(stun)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(nt)
 }
