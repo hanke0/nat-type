@@ -6,18 +6,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
 
+var (
+	verbose1 = log.New(os.Stderr, "", 0)
+	verbose2 = log.New(os.Stderr, "", 0)
+)
+
 func init() {
+	log.SetFlags(0)
+	log.SetOutput(os.Stderr)
 	rand.Seed(time.Now().UnixNano())
 }
 
 // Message Types
+// describe in
+//
+//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.1
+//	https://www.rfc-editor.org/rfc/rfc5389.html#section-6
 const (
 	BindingRequest            = 0x0001
 	BindingResponse           = 0x0101
@@ -28,6 +41,11 @@ const (
 )
 
 // Attributes Types
+// describe in
+//
+//	https://www.rfc-editor.org/rfc/rfc5389.html#section-18.2
+//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.2
+//	https://www.rfc-editor.org/rfc/rfc5780.html#section-7
 const (
 	MappedAddress     = 0x0001
 	ResponseAddress   = 0x0002
@@ -40,10 +58,19 @@ const (
 	ErrorCode         = 0x0009
 	UnknownAttributes = 0x000a
 	ReflectedFrom     = 0x000b
+	REALM             = 0x0014
+	NONCE             = 0x0015
 	XORMappedAddress  = 0x0020
+	Padding           = 0x0026
+	ResponsePort      = 0x0027
 	Software          = 0x8022
+	AlternateServer   = 0x8023
+	Fingerprint       = 0x8028
 	ResponseOrigin    = 0x802b
 	OtherAddress      = 0x802c
+
+	// Non-Standard
+	XORMappedAddressNonStd = 0x8020
 )
 
 const MagicCookie = 0x2112A442
@@ -120,8 +147,37 @@ type Attribute struct {
 	Value []byte
 }
 
-func align4(n int) int {
-	return (n + 3) & 0xfffc
+func parseAttribute(data []byte) (int, Attribute) {
+	if len(data) < 4 {
+		return 0, Attribute{}
+	}
+	typ := binary.BigEndian.Uint16(data[:2])
+	length := binary.BigEndian.Uint16(data[2:4])
+	alignlen := align4(int(length))
+	verbose2.Printf("attribute 0x%x {%d}%v", typ, length, data[4:length+4])
+	n := alignlen + 4
+	if len(data) < n {
+		return 0, Attribute{}
+	}
+	return n, Attribute{
+		Type:  int(typ),
+		Value: copybytes(data[4 : length+4]),
+	}
+}
+
+func parseAttributes(data []byte) []Attribute {
+	var r = make([]Attribute, 0)
+	verbose1.Printf("attribute length %d", len(data))
+	for len(data) > 0 {
+		n, attr := parseAttribute(data)
+		verbose2.Printf("parse 1 attribute: consume=%d, total=%d", n, len(data))
+		if n == 0 {
+			return nil
+		}
+		data = data[n:]
+		r = append(r, attr)
+	}
+	return r
 }
 
 func (a Attribute) Bytes() []byte {
@@ -133,27 +189,14 @@ func (a Attribute) Bytes() []byte {
 	return data
 }
 
-func copybytes(d []byte) []byte {
-	a := make([]byte, len(d))
-	copy(a, d)
-	return a
-}
-
-func parseAttribute(data []byte) (int, Attribute) {
-	if len(data) < 4 {
-		return 0, Attribute{}
+func (a Attribute) GetString() string {
+	if len(a.Value) == 0 {
+		return ""
 	}
-	typ := binary.BigEndian.Uint16(data[:2])
-	length := binary.BigEndian.Uint16(data[2:4])
-	alignlen := align4(int(length))
-	n := alignlen + 4
-	if len(data) < n {
-		return 0, Attribute{}
+	if a.Value[len(a.Value)-1] == 0 {
+		return string(a.Value[:len(a.Value)-1])
 	}
-	return n, Attribute{
-		Type:  int(typ),
-		Value: copybytes(data[4:length]),
-	}
+	return string(a.Value)
 }
 
 const (
@@ -161,16 +204,10 @@ const (
 	ipv6Family = 0x02
 )
 
-func xor(a, b []byte) []byte {
-	r := make([]byte, len(a))
-	for i := range a {
-		r[i] = a[i] ^ b[i]
-	}
-	return r
-}
-
-func parseAddress(data []byte, xorb []byte) *net.UDPAddr {
+func (a *Attribute) GetAddress(xorb []byte) *net.UDPAddr {
+	data := a.Value
 	if len(data) < 8 {
+		log.Printf("attribute address length too short: %d", len(data))
 		return nil
 	}
 	var (
@@ -199,28 +236,14 @@ func parseAddress(data []byte, xorb []byte) *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IP(ip), Port: int(port)}
 }
 
-func parseErrorCode(data []byte) (int, string) {
+func (a Attribute) GetErrorCode() (int, string) {
+	data := a.Value
 	if len(data) < 4 {
+		log.Printf("attribute ERROR-CODE length too short: %d", len(data))
 		return 0, ""
 	}
 	code := (int(data[2])&0x7)*100 + int(data[3])
 	return code, string(data[4:])
-}
-
-func parseAttributes(data []byte) []Attribute {
-	var r = make([]Attribute, 0)
-	for len(data) > 0 {
-		n, attr := parseAttribute(data)
-		if n == 0 {
-			return nil
-		}
-		r = append(r, attr)
-	}
-	return r
-}
-
-func listen() (*net.UDPConn, error) {
-	return net.ListenUDP("udp", nil)
 }
 
 func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
@@ -235,7 +258,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, fmt.Errorf("set sendto timeout: %w", err)
 	}
-	fmt.Println(raw)
+	verbose1.Printf("sendto %s", stun)
 	n, err := conn.WriteToUDP(raw, stun)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sendto: %w", err)
@@ -254,6 +277,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 		if err != nil {
 			return nil, nil, fmt.Errorf("recvfrom: %w", err)
 		}
+		verbose1.Printf("recvfrom %s", addr)
 		data := buf[:n]
 		var h Header
 		if len(data) < len(h) {
@@ -263,6 +287,7 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 		if !bytes.Equal(h.Transaction(), transaction) {
 			continue
 		}
+		verbose1.Printf("recvfrom message type 0x%x", h.Type())
 		data = data[len(h):]
 		length := h.Length()
 		if len(data) < length {
@@ -277,15 +302,22 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 }
 
 type Addresses struct {
-	RecvAddr         *net.UDPAddr
-	ResponseAddress  *net.UDPAddr
+	RemoteAddr       *net.UDPAddr
 	MappedAddress    *net.UDPAddr
 	SourceAddress    *net.UDPAddr
 	ChangedAddress   *net.UDPAddr
 	XORMappedAddress *net.UDPAddr
 	ErrorCode        int
 	ErrorMessage     string
+	Sofeware         string
 	UnknownAttrs     []Attribute
+}
+
+func (a *Addresses) GetMappedAddress() *net.UDPAddr {
+	if a.XORMappedAddress != nil {
+		return a.XORMappedAddress
+	}
+	return a.MappedAddress
 }
 
 func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute) (*Addresses, error) {
@@ -326,19 +358,23 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute
 	}
 
 	var addrs Addresses
-	addrs.RecvAddr = addr
+	addrs.RemoteAddr = addr
 	for _, a := range attrs {
 		switch a.Type {
 		case MappedAddress:
-			addrs.MappedAddress = parseAddress(a.Value, nil)
+			addrs.MappedAddress = a.GetAddress(nil)
 		case SourceAddress:
-			addrs.SourceAddress = parseAddress(a.Value, nil)
+			addrs.SourceAddress = a.GetAddress(nil)
 		case ChangedAddress:
-			addrs.ChangedAddress = parseAddress(a.Value, nil)
-		case ResponseAddress:
-			addrs.ResponseAddress = parseAddress(a.Value, nil)
-		case XORMappedAddress:
-			addrs.XORMappedAddress = parseAddress(a.Value, head.Transaction())
+			addrs.ChangedAddress = a.GetAddress(nil)
+		case XORMappedAddress, XORMappedAddressNonStd:
+			addrs.XORMappedAddress = a.GetAddress(head.Transaction())
+		case ErrorCode:
+			code, msg := a.GetErrorCode()
+			addrs.ErrorCode = code
+			addrs.ErrorMessage = msg
+		case Software:
+			addrs.Sofeware = a.GetString()
 		default:
 			addrs.UnknownAttrs = append(addrs.UnknownAttrs, a)
 		}
@@ -347,18 +383,33 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, sendattrs []Attribute
 }
 
 type NatType struct {
-	Addrs *Addresses
+	Addrs    *Addresses
+	Internal net.IP
 }
 
 func (nt *NatType) String() string {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
 	enc.Encode(nt)
 	return buf.String()
 }
 
 func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
+	var (
+		nt  NatType
+		err error
+	)
+	if stun.IP.To4() == nil {
+		nt.Internal, err = getInternalIPv6()
+	} else {
+		nt.Internal, err = getInternalIPv4()
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	sock, err := listen()
 	if err != nil {
 		return nil, err
@@ -368,27 +419,50 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 	if err != nil {
 		return nil, err
 	}
-	var nt NatType
 	nt.Addrs = addrs
 	return &nt, nil
 }
 
-func getInternalIPv4() net.IP {
+func getInternalIPv4() (net.IP, error) {
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 1})
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return conn.LocalAddr().(*net.UDPAddr).IP
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }
 
 var googleIPv6 = net.ParseIP("2001:4860:4860::8888")
 
-func getInternalIPv6() net.IP {
+func getInternalIPv6() (net.IP, error) {
 	conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: googleIPv6, Port: 1})
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return conn.LocalAddr().(*net.UDPAddr).IP
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP, nil
+}
+
+func listen() (*net.UDPConn, error) {
+	return net.ListenUDP("udp", nil)
+}
+
+func align4(n int) int {
+	return (n + 3) & 0xfffc
+}
+
+func xor(a, b []byte) []byte {
+	r := make([]byte, len(a))
+	for i := range a {
+		r[i] = a[i] ^ b[i]
+	}
+	return r
+}
+
+func copybytes(d []byte) []byte {
+	a := make([]byte, len(d))
+	copy(a, d)
+	return a
 }
 
 func main() {
