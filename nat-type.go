@@ -734,9 +734,9 @@ func main() {
 	}
 	for _, r := range result {
 		if r.Error != nil {
-			log.Printf("%s: %v", r.Error)
+			log.Printf("%s: %v", r.Stun, r.Error)
 		} else {
-			log.Printf("%s: %s", r.NatType)
+			log.Printf("%s: %s", r.Stun, r.NatType)
 		}
 	}
 }
