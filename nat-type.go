@@ -260,7 +260,6 @@ func sendAndRecv(conn *net.UDPConn, head Header, body []byte, timeout time.Durat
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, fmt.Errorf("set sendto timeout: %w", err)
 	}
-	verbose1.Printf("sendto %s", conn.RemoteAddr())
 	n, err := conn.Write(raw)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sendto: %w", err)
@@ -279,7 +278,6 @@ func sendAndRecv(conn *net.UDPConn, head Header, body []byte, timeout time.Durat
 		if err != nil {
 			return nil, nil, fmt.Errorf("recvfrom: %w", err)
 		}
-		verbose1.Printf("recvfrom %s", addr)
 		data := buf[:n]
 		var h Header
 		if len(data) < len(h) {
@@ -332,6 +330,7 @@ type Addresses struct {
 	SourceAddress    Addr
 	ChangedAddress   Addr
 	XORMappedAddress Addr
+	ResponseOrigin   Addr
 	ErrorCode        int
 	ErrorMessage     string
 	Software         string
@@ -427,6 +426,8 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, changeIP, changePort 
 			addrs.ChangedAddress = Addr{a.GetAddress(nil)}
 		case XORMappedAddress, XORMappedAddressNonStd:
 			addrs.XORMappedAddress = Addr{a.GetAddress(head.Transaction())}
+		case ResponseOrigin:
+			addrs.ResponseOrigin = Addr{a.GetAddress(nil)}
 		case ErrorCode:
 			code, msg := a.GetErrorCode()
 			addrs.ErrorCode = code
@@ -451,9 +452,10 @@ const (
 )
 
 type NatType struct {
-	Mapped   Addr
-	Internal Addr
-	Topology string
+	Mapped         Addr
+	Internal       Addr
+	ResponseOrigin Addr
+	Topology       string
 }
 
 func (nt *NatType) String() string {
@@ -524,8 +526,9 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 	var nt NatType
 	nt.Internal = Addr{sock.LocalAddr().(*net.UDPAddr)}
 
+	verbose1.Printf("test1 request: %s -> %s", sock.LocalAddr(), stun)
 	addrs1, err := sendBindRequest(sock, stun, false, false)
-	verbose1.Printf("test1: %v, %s", err, addrs1)
+	verbose1.Printf("test1 response: %v, %s", err, addrs1)
 	if err != nil {
 		return nil, err
 	}
@@ -539,9 +542,12 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 	if err := checkSourceAddress(addrs1, stun); err != nil {
 		return nil, err
 	}
+	nt.ResponseOrigin = addrs1.ResponseOrigin
+
 	test1same := addrEqual(addrs1.GetMappedAddress(), nt.Internal.UDPAddr)
+	verbose1.Printf("test2 request: %s -> %s", sock.LocalAddr(), stun)
 	addrs2, err := sendBindRequest(sock, stun, true, true)
-	verbose1.Printf("test2: %v, %s", err, addrs2)
+	verbose1.Printf("test2 rsponse: %v, %s", err, addrs2)
 
 	if test1same {
 		if err != nil || addrs2.GetError() != nil {
@@ -558,12 +564,13 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 		nt.Topology = FullConeNAT
 		return &nt, nil
 	}
-	changed := addrs2.GetChangedAddress()
+	changed := addrs1.GetChangedAddress()
 	if changed == nil {
-		return nil, fmt.Errorf("response error: change request receive response without changed address")
+		return nil, fmt.Errorf("response error: response without changed address")
 	}
+	verbose1.Printf("test1-1 request: %s -> %s", sock.LocalAddr(), changed)
 	addrs3, err := sendBindRequest(sock, changed, false, false)
-	verbose1.Printf("test3: %v, %s", err, addrs3)
+	verbose1.Printf("test1-1 response: %v, %s", err, addrs3)
 	if err != nil {
 		return nil, err
 	}
@@ -575,8 +582,9 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 		nt.Topology = SymmetricNAT
 		return &nt, nil
 	}
-	addrs4, err := sendBindRequest(sock, stun, false, true)
-	verbose1.Printf("test4: %v, %s", err, addrs4)
+	verbose1.Printf("test3 request: %s -> %s", sock.LocalAddr(), changed)
+	addrs4, err := sendBindRequest(sock, changed, false, true)
+	verbose1.Printf("test3 request: %v, %s", err, addrs4)
 	if err == nil && addrs4.GetError() == nil {
 		nt.Mapped = Addr{mapped}
 		nt.Topology = RestrictedConeNAT
@@ -594,26 +602,6 @@ func checkSourceAddress(addrs *Addresses, stun *net.UDPAddr) error {
 		}
 	}
 	return nil
-}
-
-func getInternalIPv4() (net.IP, error) {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 1})
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP, nil
-}
-
-var googleIPv6 = net.ParseIP("2001:4860:4860::8888")
-
-func getInternalIPv6() (net.IP, error) {
-	conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: googleIPv6, Port: 1})
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }
 
 func align4(n int) int {
@@ -684,6 +672,8 @@ func (o *Option) Parse() {
 var defaultStunServers = []string{
 	"stun.qq.com:3478",
 	"stun.miwifi.com:3478",
+	"stun.ekiga.net:3478",
+	"stun1.l.google.com:19302",
 }
 
 func natTypeTest(family, address string) (*NatType, error) {
@@ -729,14 +719,18 @@ func main() {
 	}
 	var result []Result
 	for _, s := range servers {
+		verbose1.Printf("stun test begin: %s", s)
 		nt, err := natTypeTest(family, s)
 		result = append(result, Result{Stun: s, NatType: nt, Error: err})
+		verbose1.Printf("stun test finish: %s", s)
 	}
 	for _, r := range result {
+		log.Printf("%s", r.Stun)
 		if r.Error != nil {
-			log.Printf("%s: %v", r.Stun, r.Error)
+			log.Printf("\tError:\t%v", r.Error)
 		} else {
-			log.Printf("%s: %s", r.Stun, r.NatType)
+			log.Printf("\tInternal:\t%s\n\tExternal:\t%s\n\tNAT-Type:\t%s",
+				r.NatType.Internal, r.NatType.Mapped, r.NatType.Topology)
 		}
 	}
 }
