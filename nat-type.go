@@ -29,8 +29,8 @@ func init() {
 // Message Types
 // describe in
 //
-//    https://www.rfc-editor.org/rfc/rfc3489.html#section-11.1
-//    https://www.rfc-editor.org/rfc/rfc5389.html#section-6
+//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.1
+//	https://www.rfc-editor.org/rfc/rfc5389.html#section-6
 const (
 	BindingRequest            = 0x0001
 	BindingResponse           = 0x0101
@@ -43,9 +43,9 @@ const (
 // Attributes Types
 // describe in
 //
-//    https://www.rfc-editor.org/rfc/rfc5389.html#section-18.2
-//    https://www.rfc-editor.org/rfc/rfc3489.html#section-11.2
-//    https://www.rfc-editor.org/rfc/rfc5780.html#section-7
+//	https://www.rfc-editor.org/rfc/rfc5389.html#section-18.2
+//	https://www.rfc-editor.org/rfc/rfc3489.html#section-11.2
+//	https://www.rfc-editor.org/rfc/rfc5780.html#section-7
 const (
 	MappedAddress     = 0x0001
 	ResponseAddress   = 0x0002
@@ -459,49 +459,48 @@ func (nt *NatType) String() string {
 
 // getNATTypeByRFC3489 gets NAT type as describe in rfc3489
 //
-//
-//                         +--------+
-//                         |  Test  |
-//                         |   I    |
-//                         +--------+
-//                              |
-//                              |
-//                              V
-//                             /\              /\
-//                          N /  \ Y          /  \ Y             +--------+
-//           UDP     <-------/Resp\--------->/ IP \------------->|  Test  |
-//           Blocked         \ ?  /          \Same/              |   II   |
-//                            \  /            \? /               +--------+
-//                             \/              \/                    |
-//                                              | N                  |
-//                                              |                    V
-//                                              V                    /\
-//                                          +--------+  Sym.      N /  \
-//                                          |  Test  |  UDP    <---/Resp\
-//                                          |   II   |  Firewall   \ ?  /
-//                                          +--------+              \  /
-//                                              |                    \/
-//                                              V                     |Y
-//                   /\                         /\                    |
-//    Symmetric  N  /  \       +--------+   N  /  \                   V
-//       NAT  <--- / IP \<-----|  Test  |<--- /Resp\               Open
-//                 \Same/      |   I    |     \ ?  /               Internet
-//                  \? /       +--------+      \  /
-//                   \/                         \/
-//                   |                           |Y
-//                   |                           |
-//                   |                           V
-//                   |                           Full
-//                   |                           Cone
-//                   V              /\
-//               +--------+        /  \ Y
-//               |  Test  |------>/Resp\---->Restricted
-//               |   III  |       \ ?  /
-//               +--------+        \  /
-//                                  \/
-//                                   |N
-//                                   |       Port
-//                                   +------>Restricted
+//	                     +--------+
+//	                     |  Test  |
+//	                     |   I    |
+//	                     +--------+
+//	                          |
+//	                          |
+//	                          V
+//	                         /\              /\
+//	                      N /  \ Y          /  \ Y             +--------+
+//	       UDP     <-------/Resp\--------->/ IP \------------->|  Test  |
+//	       Blocked         \ ?  /          \Same/              |   II   |
+//	                        \  /            \? /               +--------+
+//	                         \/              \/                    |
+//	                                          | N                  |
+//	                                          |                    V
+//	                                          V                    /\
+//	                                      +--------+  Sym.      N /  \
+//	                                      |  Test  |  UDP    <---/Resp\
+//	                                      |   II   |  Firewall   \ ?  /
+//	                                      +--------+              \  /
+//	                                          |                    \/
+//	                                          V                     |Y
+//	               /\                         /\                    |
+//	Symmetric  N  /  \       +--------+   N  /  \                   V
+//	   NAT  <--- / IP \<-----|  Test  |<--- /Resp\               Open
+//	             \Same/      |   I    |     \ ?  /               Internet
+//	              \? /       +--------+      \  /
+//	               \/                         \/
+//	               |                           |Y
+//	               |                           |
+//	               |                           V
+//	               |                           Full
+//	               |                           Cone
+//	               V              /\
+//	           +--------+        /  \ Y
+//	           |  Test  |------>/Resp\---->Restricted
+//	           |   III  |       \ ?  /
+//	           +--------+        \  /
+//	                              \/
+//	                               |N
+//	                               |       Port
+//	                               +------>Restricted
 //
 // In test I, the client sends a
 // STUN Binding Request to a server, without any flags set in the
@@ -551,12 +550,16 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 		nt.Topology = OpenInternet
 		return &nt, nil
 	}
-	if err ==nil && addrs2.GetError() == nil {
+	if err == nil && addrs2.GetError() == nil {
 		nt.Mapped = Addr{mapped}
 		nt.Topology = FullConeNAT
 		return &nt, nil
 	}
-	addrs3, err := sendBindRequest(sock, stun, false, false)
+	changed := addrs2.GetChangedAddress()
+	if changed == nil {
+		return nil, fmt.Errorf("response error: change request receive response without changed address")
+	}
+	addrs3, err := sendBindRequest(sock, changed, false, false)
 	verbose1.Printf("test3: %v, %s", err, addrs3)
 	if err != nil {
 		return nil, err
@@ -569,6 +572,15 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 		nt.Topology = SymmetricNAT
 		return &nt, nil
 	}
+	addrs4, err := sendBindRequest(sock, stun, false, true)
+	verbose1.Printf("test4: %v, %s", err, addrs4)
+	if err == nil && addrs4.GetError() == nil {
+		nt.Mapped = Addr{mapped}
+		nt.Topology = RestrictedConeNAT
+		return &nt, nil
+	}
+	nt.Mapped = Addr{mapped}
+	nt.Topology = RestrictedPortConeNAT
 	return &nt, nil
 }
 
