@@ -246,8 +246,7 @@ func (a Attribute) GetErrorCode() (int, string) {
 	return code, string(data[4:])
 }
 
-func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
-	head Header, body []byte, timeout time.Duration) ([]Attribute, *net.UDPAddr, error) {
+func sendAndRecv(conn *net.UDPConn, head Header, body []byte, timeout time.Duration) ([]Attribute, *net.UDPAddr, error) {
 	if len(body) > math.MaxUint16 {
 		return nil, nil, errors.New("too big data body")
 	}
@@ -258,8 +257,8 @@ func sendAndRecv(conn *net.UDPConn, stun *net.UDPAddr,
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, fmt.Errorf("set sendto timeout: %w", err)
 	}
-	verbose1.Printf("sendto %s", stun)
-	n, err := conn.WriteToUDP(raw, stun)
+	verbose1.Printf("sendto %s", conn.RemoteAddr())
+	n, err := conn.Write(raw)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sendto: %w", err)
 	}
@@ -351,6 +350,10 @@ func (a *Addresses) GetSourceAddress() *net.UDPAddr {
 	return a.SourceAddress.UDPAddr
 }
 
+func (a *Addresses) GetChangedAddress() *net.UDPAddr {
+	return a.ChangedAddress.UDPAddr
+}
+
 func (a *Addresses) GetError() error {
 	if a.ErrorCode != 0 {
 		return fmt.Errorf("%d %s", a.ErrorCode, a.ErrorMessage)
@@ -395,7 +398,7 @@ func sendBindRequest(conn *net.UDPConn, stun *net.UDPAddr, changeIP, changePort 
 	var timeout = time.Millisecond * 100
 	const maxTimeout = time.Second + time.Millisecond*600 // 1.6s
 	for i := 0; i < 9; i++ {
-		attrs, _, err = sendAndRecv(conn, stun, head, data, timeout)
+		attrs, _, err = sendAndRecv(conn, head, data, timeout)
 		if err != nil {
 			timeout *= 2
 			if timeout > maxTimeout {
@@ -548,13 +551,30 @@ func getNATTypeByRFC3489(stun *net.UDPAddr) (*NatType, error) {
 		nt.Topology = OpenInternet
 		return &nt, nil
 	}
-
+	if err ==nil && addrs2.GetError() == nil {
+		nt.Mapped = Addr{mapped}
+		nt.Topology = FullConeNAT
+		return &nt, nil
+	}
+	addrs3, err := sendBindRequest(sock, stun, false, false)
+	verbose1.Printf("test3: %v, %s", err, addrs3)
+	if err != nil {
+		return nil, err
+	}
+	if addrs3.GetError() != nil {
+		return nil, addrs3.GetError()
+	}
+	if !addrEqual(addrs3.GetMappedAddress(), mapped) {
+		nt.Mapped = Addr{mapped}
+		nt.Topology = SymmetricNAT
+		return &nt, nil
+	}
 	return &nt, nil
 }
 
 func checkSourceAddress(addrs *Addresses, stun *net.UDPAddr) error {
 	if source := addrs.GetSourceAddress(); source != nil {
-		if addrEqual(source, stun) {
+		if !addrEqual(source, stun) {
 			return errors.New("server error: bad response IP/port")
 		}
 	}
@@ -615,7 +635,7 @@ func addrEqual(a, b *net.UDPAddr) bool {
 }
 
 func main() {
-	stun, err := net.ResolveUDPAddr("udp4", "stun.qq.com:3478")
+	stun, err := net.ResolveUDPAddr("udp4", "stun.miwifi.com:3478")
 	if err != nil {
 		panic(err)
 	}
@@ -623,5 +643,6 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	verbose1.Println()
 	fmt.Println(nt)
 }
