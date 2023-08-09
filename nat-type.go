@@ -5,12 +5,15 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -646,15 +649,94 @@ func addrEqual(a, b *net.UDPAddr) bool {
 	return bytes.Equal(a.IP, b.IP) && a.Port == b.Port
 }
 
+type Option struct {
+	Servers   string
+	IPv4      bool
+	IPv6      bool
+	NoDefault bool
+	Verbose   flagCount
+}
+
+type flagCount int
+
+func (f flagCount) String() string {
+	return strconv.Itoa(int(f))
+}
+
+func (f flagCount) IsBoolFlag() bool {
+	return true
+}
+
+func (f *flagCount) Set(s string) error {
+	*f++
+	return nil
+}
+
+func (o *Option) Parse() {
+	flag.StringVar(&o.Servers, "a", "", "stun servers(hostname:port), multi server split by ,")
+	flag.BoolVar(&o.IPv4, "4", false, "test IPv4")
+	flag.BoolVar(&o.IPv6, "6", true, "test IPv6")
+	flag.BoolVar(&o.NoDefault, "nodefault", false, "disable default stun servers")
+	flag.Var(&o.Verbose, "v", "set verbose mode")
+	flag.Parse()
+}
+
+var defaultStunServers = []string{
+	"stun.qq.com:3478",
+	"stun.miwifi.com:3478",
+}
+
+func natTypeTest(family, address string) (*NatType, error) {
+	stun, err := net.ResolveUDPAddr(family, address)
+	if err != nil {
+		return nil, err
+	}
+	return getNATTypeByRFC3489(stun)
+}
+
+type Result struct {
+	Stun    string
+	NatType *NatType
+	Error   error
+}
+
 func main() {
-	stun, err := net.ResolveUDPAddr("udp4", "stun.miwifi.com:3478")
-	if err != nil {
-		panic(err)
+	var opt Option
+	opt.Parse()
+	family := "udp"
+	if opt.IPv6 {
+		family = "udp6"
 	}
-	nt, err := getNATTypeByRFC3489(stun)
-	if err != nil {
-		panic(err)
+	if opt.IPv4 {
+		family = "udp4"
 	}
-	verbose1.Println()
-	fmt.Println(nt)
+	if opt.Verbose < 2 {
+		verbose2.SetOutput(io.Discard)
+	}
+	if opt.Verbose < 1 {
+		verbose1.SetOutput(io.Discard)
+	}
+	var servers []string
+	if !opt.NoDefault {
+		servers = append(servers, defaultStunServers...)
+	}
+	lists := strings.Split(opt.Servers, ",")
+	for _, i := range lists {
+		i = strings.TrimSpace(i)
+		if i != "" {
+			servers = append(servers, i)
+		}
+	}
+	var result []Result
+	for _, s := range servers {
+		nt, err := natTypeTest(family, s)
+		result = append(result, Result{Stun: s, NatType: nt, Error: err})
+	}
+	for _, r := range result {
+		if r.Error != nil {
+			log.Printf("%s: %v", r.Error)
+		} else {
+			log.Printf("%s: %s", r.NatType)
+		}
+	}
 }
