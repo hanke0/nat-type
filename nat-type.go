@@ -663,7 +663,7 @@ func (f *flagCount) Set(s string) error {
 func (o *Option) Parse() {
 	flag.StringVar(&o.Servers, "a", "", "stun servers(hostname:port), multi server split by ,")
 	flag.BoolVar(&o.IPv4, "4", false, "test IPv4")
-	flag.BoolVar(&o.IPv6, "6", true, "test IPv6")
+	flag.BoolVar(&o.IPv6, "6", false, "test IPv6")
 	flag.BoolVar(&o.NoDefault, "nodefault", false, "disable default stun servers")
 	flag.Var(&o.Verbose, "v", "set verbose mode")
 	flag.Parse()
@@ -672,7 +672,7 @@ func (o *Option) Parse() {
 var defaultStunServers = []string{
 	"stun.qq.com:3478",
 	"stun.miwifi.com:3478",
-	"stun.ekiga.net:3478",
+	"stun.nextcloud.com:443",
 	"stun1.l.google.com:19302",
 }
 
@@ -693,7 +693,7 @@ type Result struct {
 func main() {
 	var opt Option
 	opt.Parse()
-	family := "udp"
+	family := "udp4"
 	if opt.IPv6 {
 		family = "udp6"
 	}
